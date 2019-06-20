@@ -1,0 +1,92 @@
+# Golang CircleCI 2.0 configuration file
+#
+# Check https://circleci.com/docs/2.0/language-go/ for more details
+version: 2
+jobs:
+  build:
+    docker:
+      # specify the version
+      - image: circleci/golang:1.12
+
+      # Specify service dependencies here if necessary
+      # CircleCI maintains a library of pre-built images
+      # documented at https://circleci.com/docs/2.0/circleci-images/
+      # - image: circleci/postgres:9.4
+
+    #### TEMPLATE_NOTE: go expects specific checkout path representing url
+    #### expecting it in the form of
+    ####   /go/src/github.com/circleci/go-tool
+    ####   /go/src/bitbucket.org/circleci/go-tool
+    working_directory: /go/src/github.com/thales-e-security/hancock-signing
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 18.06.0-ce
+          docker_layer_caching: true
+
+      # specify any bash command here prefixed with `run: `
+      - run: go get -v -t -d ./...
+      - run: go test -v ./...
+      - run: docker login -u ${DOCKER_USER} -p ${DOCKER_PASS}
+      - run: docker build -t thalesesecurity/hancock-signing .
+      - run: docker push thalesesecurity/hancock-signing
+      - run:
+          environment:
+            HANCOCK_HOST: 'https://signatory.alpha.tes-labs.technology'
+            KEYURI: 'app-id.domain-id.tenant-id'
+            DOCKER_CLI_EXPERIMENTAL: enabled
+          command: |
+            set -e
+            set -x
+
+            git clone http://${ACCESS_TOKEN}:${ACCESS_SECRET}@git.tesdev.io/td/hancock/signing-tool
+            cd signing-tool
+
+            sudo apt-get install python3 python3-venv gpg jq
+
+            python3 --version
+
+            python3 -m venv env
+            source env/bin/activate
+            pip3 install -r requirements.txt
+
+            docker manifest inspect thalesesecurity/hancock-signing > manifest.json
+            cat manifest.json
+
+            echo "SIGNING MANIFEST:"
+            python3 -m signing_tool --host ${HANCOCK_HOST}:443 --keyuri app-id.domain-id.tenant-id raw --file manifest.json > manifest.sig
+            cat manifest.sig
+
+            # Generate a local key to validate
+            cat >keygen <<EOF
+               %echo Generating a basic OpenPGP key
+               Key-Type: RSA
+               Key-Usage: cert
+               Subkey-Type: RSA
+               Subkey-Usage: sign
+               Name-Real: Client
+               Expire-Date: 0
+               %no-protection
+               %commit
+               %echo done
+            EOF
+            gpg --batch --generate-key keygen
+
+            # Get public keys
+            TENANT_ID=$(curl -X GET -H "Authorization: Bearer ${HANCOCK_KM_JWT}" ${HANCOCK_HOST}/km/tenants | jq '.[] | .id' | tr -d '"')
+            DOMAIN_ID=$(curl -X GET -H "Authorization: Bearer ${HANCOCK_KM_JWT}" ${HANCOCK_HOST}/km/tenants/tenant-id/domains | jq '.[] | .id' | tr -d '"')
+            APP_ID=$(curl -X GET -H "Authorization: Bearer ${HANCOCK_KM_JWT}" ${HANCOCK_HOST}/km/tenants/tenant-id/domains/domain-id/applications | jq '.[] | .id' | tr -d '"')
+
+            curl -X GET "${HANCOCK_HOST}/pks/lookup?op=get&search=${TENANT_ID}" | gpg --import
+            curl -X GET "${HANCOCK_HOST}/pks/lookup?op=get&search=${DOMAIN_ID}" | gpg --import
+            curl -X GET "${HANCOCK_HOST}/pks/lookup?op=get&search=${APP_ID}" | gpg --import
+
+            # Istio currently doesn't support HTTP/1.0 used by gpg. Should be support released in 1.2.1
+            #gpg --keyserver ${SECURE_KEYSERVER} --recv-keys ${TENANT_ID}
+            #gpg --keyserver ${SECURE_KEYSERVER} --recv-keys ${DOMAIN_ID}
+            #gpg --keyserver ${SECURE_KEYSERVER} --recv-keys ${APP_ID}
+
+            # Trust sign Tenant with Client
+            echo -e "2\n3\n\ny\nsave\n" | gpg --command-fd 0 -u Client --edit-key tenant-id tsign
+
+            gpg -u Client --verify manifest.sig manifest.json
