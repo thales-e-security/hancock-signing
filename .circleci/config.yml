@@ -37,7 +37,6 @@ jobs:
             DOCKER_CLI_EXPERIMENTAL: enabled
           command: |
             set -e
-            set -x
 
             git clone http://${ACCESS_TOKEN}:${ACCESS_SECRET}@git.tesdev.io/td/hancock/signing-tool
             cd signing-tool
